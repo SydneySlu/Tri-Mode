@@ -1,132 +1,182 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# Modified for Tri-Modal Project
 
 import sys
-
 sys.path.append("src")
 sys.path.append("./")
+
 import os
 import random
-
 import torch
 import torch.nn.functional as F
-import argparse, pickle, pdb
+import argparse
+import pickle
 import numpy as np
 
+# Dependency: pip install kmeans-pytorch
 from kmeans_pytorch import KMeans as BalancedKMeans
 from get_prep_parser import get_args_parser, get_default_paths
 
-# 自动检测设备 (CPU用户的福音)
+# --- Device Detection ---
 if torch.cuda.is_available():
     device = torch.device('cuda')
+    print("[Config] CUDA detected. Using GPU for clustering.")
 else:
     device = torch.device('cpu')
-    print("⚠️ 未检测到 CUDA，正在使用 CPU 运行聚类...")
+    print("[Config] CUDA not found. Switching to CPU mode.")
 
 
 def cluster_fine(n_clusters, args, balanced=1):
     path_to_fine = os.path.join(args.ccenter_dir, args.cd, f'F{n_clusters}.pth')
     os.makedirs(os.path.dirname(path_to_fine), exist_ok=True)
+    
     if os.path.exists(path_to_fine):
-        print(f'{path_to_fine} is written')
+        print(f'[Info] File already exists, skipping: {path_to_fine}')
         return True
 
-    print(f'Preparing data for file {path_to_fine}')
+    print(f'[Info] Preparing data for fine clustering: {path_to_fine}')
     file_for_run = []
 
-    # --- 修改点 1：安全遍历文件夹 ---
+    # --- Robust Directory Traversal ---
+    # Iterating through potential subdirectories (legacy support) or root dir
+    search_dirs = [args.feature_dir]
+    # Add numbered subdirectories if they exist (0-99)
     for i in range(100):
-        # 构造路径
-        dir_path = os.path.join(args.feature_dir, str(i))
+        sub_dir = os.path.join(args.feature_dir, str(i))
+        if os.path.exists(sub_dir):
+            search_dirs.append(sub_dir)
 
-        # 如果文件夹不存在，直接跳过 (防止 67, 68... 报错)
+    for dir_path in search_dirs:
         if not os.path.exists(dir_path):
             continue
-
-        feat_files = os.listdir(dir_path)
+            
+        feat_files = [f for f in os.listdir(dir_path) if f.endswith('.pth') and 'feat' in f]
         num_files = len(feat_files)
 
-        # 如果是空文件夹，也跳过
         if num_files == 0:
             continue
 
-        num_fun_files = int(num_files * 0.05) + 1  # num_files
-        files = np.random.choice(feat_files, num_fun_files).tolist()
-        file_for_run.extend([os.path.join(dir_path, file) for file in files])
-    # ---------------------------
+        # Sampling strategy: Take 5% of files to speed up clustering on large datasets
+        # For small datasets, take at least 1 file
+        num_fun_files = int(num_files * 0.05) + 1 
+        selected_files = np.random.choice(feat_files, num_fun_files, replace=False).tolist()
+        file_for_run.extend([os.path.join(dir_path, f) for f in selected_files])
 
     if len(file_for_run) == 0:
-        print("❌ 错误：没有找到任何特征文件！请检查 prep_feature.py 是否成功生成了 .pth 文件。")
+        print("[Error] No feature files found! Please check 'prep_feature_tri.py' output.")
         return False
 
     np.random.shuffle(file_for_run)
-    print('{} files are selected'.format(len(file_for_run)))
+    print(f'[Info] Selected {len(file_for_run)} files for clustering training.')
 
-    # 聚类器初始化
-    kmeans = BalancedKMeans(n_clusters=n_clusters, device=device, balanced=(balanced == 1))
+    # --- Load Data into Memory ---
+    all_feats = []
     total_size = 0
-
+    
+    print("[Info] Loading features...")
     for i, file in enumerate(file_for_run):
-        print(i, file)
-        # --- 修改点 2：将 .cuda() 改为 .to(device) ---
-        # 还要确保加载时 map_location 指向设备
-        data = torch.load(file, map_location=device)
-        feat = F.normalize(data['feat'].to(device), dim=-1)
+        try:
+            # Map location ensures CPU compatibility if trained on GPU
+            data = torch.load(file, map_location=device)
+            
+            # Handle different saving formats (dict vs tensor)
+            if isinstance(data, dict) and 'feat' in data:
+                feat = data['feat']
+            else:
+                feat = data
+            
+            # Normalize features
+            feat = F.normalize(feat.to(device), dim=-1)
+            all_feats.append(feat)
+            total_size += feat.size(0)
+            
+        except Exception as e:
+            print(f"[Warning] Failed to load {file}: {e}")
 
-        total_size += feat.size(0)
+    if not all_feats:
+        print("[Error] No valid features loaded.")
+        return False
 
-        # 注意：kmeans.fit 内部可能也有 device 处理，但输入必须对齐
-        if 'cos' in args.cd:
-            kmeans.fit(feat, distance='cosine', iter_limit=50, online=True, iter_k=i)
-        elif 'euc' in args.cd.lower():  # euclidean
-            kmeans.fit(feat, distance='euclidean', iter_limit=50, online=True, iter_k=i)
-        else:
-            raise ValueError('Not Implemented')
+    # Concatenate all features
+    X = torch.cat(all_feats, dim=0)
+    print(f'[Info] Total samples: {total_size}, Dimension: {X.size(1)}')
 
-        if (i + 1) % 100 == 0:
-            print(f'checkpointing at step {i}')
-            # 保存时转回 CPU 以便兼容
-            torch.save({'center': kmeans.cluster_centers.cpu()}, path_to_fine)
+    # Safety check: Cannot cluster if samples < n_clusters
+    if total_size < n_clusters:
+        print(f"[Warning] Sample size ({total_size}) is smaller than target clusters ({n_clusters}).")
+        print(f"          Adjusting n_clusters to {total_size}.")
+        n_clusters = total_size
 
-    print('there are {} files involved in clustering'.format(total_size))
+    # --- Clustering Execution ---
+    print(f'[Info] Initializing BalancedKMeans (K={n_clusters})...')
+    kmeans = BalancedKMeans(n_clusters=n_clusters, device=device, balanced=(balanced == 1))
 
-    # 保存结果
+    # Fit logic
+    dist_metric = 'cosine' if 'cos' in args.cd else 'euclidean'
+    print(f"[Info] Fitting using {dist_metric} distance...")
+    
+    kmeans.fit(X, distance=dist_metric, iter_limit=50, online=False)
+
+    print('[Success] Clustering converged.')
+
+    # Save sklearn-compatible pickle (optional)
     try:
-        with open(path_to_fine.replace('.pth', '.pkl'), 'wb+') as f:
-            _ = pickle.dump(kmeans, f)
+        pkl_path = path_to_fine.replace('.pth', '.pkl')
+        with open(pkl_path, 'wb+') as f:
+            pickle.dump(kmeans, f)
     except Exception as e:
-        print(f"Warning: Pickle dump failed ({e}), skipping pkl save.")
+        print(f"[Warning] Pickle dump failed ({e}), skipping .pkl save.")
 
+    # Save PyTorch centroids (Critical for next steps)
     torch.save({'center': kmeans.cluster_centers.cpu()}, path_to_fine)
-    print(f"✅ 成功生成数据专家权重: {path_to_fine}")
+    print(f"[Success] Expert weights saved to: {path_to_fine}")
     return True
 
 
 def cluster_coarse(n_clusters, args, balanced=1):
+    # This step clusters the fine centroids into coarse centroids (Hierarchy)
     path_to_fine = os.path.join(args.ccenter_dir, args.cd, f'F{args.cm}.pth')
+    
     if not os.path.exists(path_to_fine):
-        print(f"❌ 找不到细粒度中心文件: {path_to_fine}，无法进行粗粒度聚类。")
+        print(f"[Error] Fine cluster centers not found: {path_to_fine}")
+        print("        Cannot proceed with coarse clustering.")
         return False
 
     centers = torch.load(path_to_fine, map_location=device)['center']
+    print(f"[Info] Loaded {centers.size(0)} fine-grained centers.")
 
     path_to_coarse = os.path.join(args.ccenter_dir, args.cd, f'F{args.cm}-C{n_clusters}.pth')
-    if os.path.exists(path_to_coarse):
-        print(f'{path_to_coarse} is written')
+    
+    # Check if we actually need clustering (if fine <= coarse)
+    if centers.size(0) <= n_clusters:
+        print(f"[Info] Fine centers ({centers.size(0)}) <= Coarse target ({n_clusters}).")
+        print("       Skipping secondary clustering. Using fine centers as coarse.")
+        assign = torch.arange(centers.size(0))
+        torch.save({'coarse': centers.cpu(), 'assign': assign.cpu()}, path_to_coarse)
+        print(f"[Success] Coarse weights saved to: {path_to_coarse}")
         return True
 
+    if os.path.exists(path_to_coarse):
+        print(f'[Info] File already exists, skipping: {path_to_coarse}')
+        return True
+
+    print(f'[Info] Starting coarse clustering (K={n_clusters})...')
     kmeans = BalancedKMeans(n_clusters=n_clusters, device=device, balanced=(balanced == 1))
 
-    # --- 修改点 3：将 .cuda() 改为 .to(device) ---
-    if 'cos' in args.cd:
-        kmeans.fit(F.normalize(centers.to(device), dim=-1), distance='cosine', iter_limit=100, online=False)
-    elif 'euc' in args.cd.lower():  # euclidean
-        kmeans.fit(centers.to(device), distance='euclidean', iter_limit=100, online=False)
+    dist_metric = 'cosine' if 'cos' in args.cd else 'euclidean'
+    
+    if dist_metric == 'cosine':
+        centers_input = F.normalize(centers.to(device), dim=-1)
     else:
-        raise ValueError('Not Implemented')
+        centers_input = centers.to(device)
 
-    assign = kmeans.predict(centers.to(device), args.cd)
+    kmeans.fit(centers_input, distance=dist_metric, iter_limit=100, online=False)
+
+    # Predict assignments
+    assign = kmeans.predict(centers_input, choice=dist_metric)
+    
     torch.save({'coarse': kmeans.cluster_centers.cpu(), 'assign': assign.cpu()}, path_to_coarse)
-    print(f"✅ 成功生成粗粒度聚类: {path_to_coarse}")
+    print(f"[Success] Coarse clustering weights saved to: {path_to_coarse}")
     return True
 
 
@@ -134,11 +184,18 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser('Clustering Evaluation', parents=[get_args_parser()])
     config = parser.parse_args()
 
-    # 确保输出目录存在
-    paths = get_default_paths()[config.dataset]
-    config.feature_dir = paths['feature']
-    config.ccenter_dir = paths['cluster']
+    # --- Path Configuration (Override for Tri-MoDE structure) ---
+    # Default to relative paths if not specified
+    if not config.feature_dir:
+        config.feature_dir = "./data/features"
+    if not config.ccenter_dir:
+        config.ccenter_dir = "./data/cluster_center"
 
-    # 运行聚类
+    print(f"[Config] Feature Dir: {config.feature_dir}")
+    print(f"[Config] Cluster Dir: {config.ccenter_dir}")
+    print(f"[Config] Fine Clusters (cm): {config.cm}")
+    print(f"[Config] Coarse Clusters (cn): {config.cn}")
+
+    # Execution
     cluster_fine(config.cm, config)
     cluster_coarse(config.cn, config)
