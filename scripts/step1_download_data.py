@@ -1,79 +1,92 @@
 import os
-
-# --- 1. 镜像加速 ---
-# Mirror for regions with restricted access to Hugging Face
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-print("镜像加速已开启：https://hf-mirror.com")
-
-from datasets import load_dataset, Audio
-import soundfile as sf
+import io
 import numpy as np
-import io  # <--- 新增：用于处理二进制流
+import soundfile as sf
+from datasets import load_dataset, Audio
 
-# 设置保存路径
-save_dir = "./data/raw"
-os.makedirs(save_dir, exist_ok=True)
+# --- Configuration ---
 
-print("准备下载 ESC-50 数据集...")
+# Mirror configuration for regions with restricted access to Hugging Face
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+print("[Config] Hugging Face Mirror enabled: https://hf-mirror.com")
 
-try:
-    # --- 2. 加载数据集 ---
-    # streaming=False 保证先下载完文件
-    dataset = load_dataset("ashraq/esc50", split="train", streaming=False)
+# Relative path for data storage
+SAVE_DIR = "./data/raw"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-    print("元数据加载成功！")
-    print("正在执行关键操作：禁止自动解码 (Bypass torchcodec)...")
+def download_and_process():
+    print(">>> Initializing ESC-50 dataset download...")
+    print("    (Using 'ashraq/esc50' parquet version for stability)")
 
-    # 核心修改：decode=False
-    # datasets："别尝试解码音频，直接给我二进制 Bytes"
-    dataset = dataset.cast_column("audio", Audio(decode=False))
+    try:
+        # --- 1. Load Dataset ---
+        # streaming=False ensures the entire file is downloaded first to avoid network timeouts
+        dataset = load_dataset("ashraq/esc50", split="train", streaming=False)
+        
+        print("[Info] Metadata loaded successfully.")
+        print("[Info] Bypassing automatic decoding (torchcodec workaround)...")
 
-    print(f"已准备就绪,数据集包含 {len(dataset)} 个样本。")
-    print("开始提取前 20 个样本到本地...")
+        # --- 2. Bypass Decoding ---
+        # Critical fix: Set decode=False to retrieve raw bytes.
+        # This prevents the 'torchcodec' error on Windows.
+        dataset = dataset.cast_column("audio", Audio(decode=False))
 
-    count = 0
+        print(f"[Info] Dataset ready. Total samples available: {len(dataset)}")
+        print(">>> Extracting first 20 samples to local storage...")
 
-    # 遍历数据集
-    for i in range(len(dataset)):
-        if count >= 20: break
+        count = 0
+        target_count = 20
 
-        try:
-            sample = dataset[i]
+        # --- 3. Iterate and Process ---
+        for i in range(len(dataset)):
+            if count >= target_count: 
+                break
 
-            # --- 3. 手动解码 (绕过 Windows 限制) ---
-            # 因为设置了 decode=False，这里拿到的是字典：{'bytes': b'...', 'path': ...}
-            audio_bytes = sample['audio']['bytes']
-            label = sample['category']
+            try:
+                sample = dataset[i]
 
-            # 使用 soundfile + io 直接从内存读取二进制数据
-            # 这样就彻底不需要 torchcodec 了！
-            audio_array, sampling_rate = sf.read(io.BytesIO(audio_bytes))
+                # Extract raw bytes and label
+                # Since decode=False, we get a dictionary: {'bytes': b'...', 'path': ...}
+                audio_bytes = sample['audio']['bytes']
+                label = sample['category']
 
-            # --- 4. 构造文本 ---
-            caption = f"A sound of {label}."
+                # --- 4. Manual Decoding ---
+                # Use soundfile + io to read bytes directly from memory
+                audio_array, sampling_rate = sf.read(io.BytesIO(audio_bytes))
 
-            print(f"\n[样本 {count}]")
-            print(f"  - 类别: {label}")
-            print(f"  - 音频形状: {audio_array.shape}, SR: {sampling_rate}")
+                # --- 5. Construct Caption ---
+                caption = f"A sound of {label}."
 
-            # --- 5. 保存 ---
-            filename = os.path.join(save_dir, f"sample_{count}.wav")
-            sf.write(filename, audio_array, sampling_rate)
+                # Log progress
+                print(f"\n[Sample {count}]")
+                print(f"  - Category: {label}")
+                print(f"  - Shape:    {audio_array.shape}, SR: {sampling_rate}")
 
-            with open(filename.replace('.wav', '.txt'), 'w', encoding='utf-8') as f:
-                f.write(caption)
+                # --- 6. Save Files ---
+                # Save Audio (.wav)
+                wav_filename = os.path.join(SAVE_DIR, f"sample_{count}.wav")
+                sf.write(wav_filename, audio_array, sampling_rate)
 
-            print(f"  - 已保存: {filename}")
-            count += 1
+                # Save Text (.txt)
+                txt_filename = wav_filename.replace('.wav', '.txt')
+                with open(txt_filename, 'w', encoding='utf-8') as f:
+                    f.write(caption)
 
-        except Exception as inner_e:
-            print(f"跳过样本 {i}: {inner_e}")
-            continue
+                print(f"  - Saved to: {wav_filename}")
+                count += 1
 
-    print("-" * 50)
-    print(f"数据准备 Phase 1 完成！")
-    print(f"数据已保存在: {save_dir}")
-    print("-" * 50)
+            except Exception as inner_e:
+                print(f"[Warning] Skipping sample {i} due to error: {inner_e}")
+                continue
 
-except Exception as e:
-    print(f"\n错误: {e}")
+        print("-" * 60)
+        print(">>> Phase 1: Data Preparation Complete.")
+        print(f"    Raw data saved in: {SAVE_DIR}")
+        print("-" * 60)
+
+    except Exception as e:
+        print(f"\n[Error] Dataset download failed: {e}")
+        print("Tip: Check your internet connection or HF_ENDPOINT settings.")
+
+if __name__ == "__main__":
+    download_and_process()
