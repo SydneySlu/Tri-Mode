@@ -1,6 +1,7 @@
 import os
 
-# --- 1. 强制镜像加速 ---
+# --- 1. 镜像加速 ---
+# Mirror for regions with restricted access to Hugging Face
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 print("镜像加速已开启：https://hf-mirror.com")
 
@@ -10,7 +11,7 @@ import numpy as np
 import io  # <--- 新增：用于处理二进制流
 
 # 设置保存路径
-save_dir = "D:/TriMode_Data/raw"
+save_dir = "./data/raw"
 os.makedirs(save_dir, exist_ok=True)
 
 print("准备下载 ESC-50 数据集...")
