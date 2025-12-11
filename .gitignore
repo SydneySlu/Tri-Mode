@@ -1,0 +1,26 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 大文件与数据 (绝对不能传)
+*.pth
+*.pt
+*.tar
+*.wav
+*.mp3
+*.jpg
+*.png
+!assets/*.png  # 允许上传 assets 文件夹里的图
+
+# 数据集目录
+data/
+output/
+features/
+clusters/
+assignments/
+
+# 环境变量与IDE配置
+.env
+.vscode/
+.idea/
+*.log
