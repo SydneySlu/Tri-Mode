@@ -8,8 +8,8 @@ import io
 from tqdm import tqdm
 
 # --- 配置路径 ---
-SOURCE_DIR = "D:/TriMode_Data/raw"  # 刚才下载的原始文件
-DEST_DIR = "D:/TriMode_Data/shards"  # 打包后的输出目录
+SOURCE_DIR = "./data/raw"  # 刚才下载的原始文件
+DEST_DIR = "./data/shards"  # 打包后的输出目录
 SAMPLES_PER_TAR = 50  # 每个 tar 包放多少个样本
 
 os.makedirs(DEST_DIR, exist_ok=True)
